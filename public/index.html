@@ -15,6 +15,7 @@
       <button id="btn-demo">载入示例</button>
       <button id="btn-undo" disabled>撤销</button>
       <button id="btn-retime">区间变速</button>
+      <button id="btn-speed">读速校正</button>
       <button id="btn-frame">帧对齐</button>
       <button id="btn-export" class="primary" disabled>导出 SRT</button>
       <span class="sep"></span>
@@ -65,6 +66,28 @@
           <tr><th class="col-idx">#</th><th>对齐前 起 → 止</th><th>对齐后 起 → 止</th><th>起偏移</th><th>止偏移</th><th>文本</th></tr>
         </thead>
         <tbody id="frame-preview-body"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="speed-panel" hidden>
+    <div class="retime-row">
+      <label>入点 <input id="speed-in" class="mono" type="text" placeholder="00:00:00,000"></label>
+      <label>出点 <input id="speed-out" class="mono" type="text" placeholder="00:00:10,000"></label>
+      <label>每秒最大字符数 <input id="speed-cps" class="mono" type="text" value="15" inputmode="decimal"></label>
+      <button id="btn-speed-preview" class="primary">预览</button>
+      <button id="btn-speed-apply" disabled>确认校正</button>
+      <button id="btn-speed-cancel" disabled>取消预览</button>
+      <button id="btn-speed-close" title="收起面板">收起</button>
+    </div>
+    <div id="speed-info"></div>
+    <ul id="speed-conflicts"></ul>
+    <div id="speed-preview" hidden>
+      <table>
+        <thead>
+          <tr><th class="col-idx">#</th><th>校正前 起 → 止</th><th>校正后 起 → 止</th><th>字数</th><th>校正前 字/秒</th><th>校正后 字/秒</th><th>延长量</th><th>文本</th></tr>
+        </thead>
+        <tbody id="speed-preview-body"></tbody>
       </table>
     </div>
   </section>

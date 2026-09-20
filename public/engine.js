@@ -28,6 +28,13 @@
  *     使所有点的总绝对偏移最小；总分相同取整体较早（逐帧下标字典序更小）方案；
  *   - 始终保持每块 >= 500ms、相邻间隔 >= 100ms、起点 >= 0 与原顺序；
  *   - 任一点超出容差或无可行方案时返回可定位冲突，不修改任何字幕。
+ *
+ * 读速校正：
+ *   - 按去除空白后的 Unicode 字符数与每秒最大字符数计算每条字幕所需时长；
+ *   - 不改文本、不改起点，仅把过快字幕的终点向后延长（且不短于 500ms）；
+ *   - 延长引发的挤占只在处理区间内递归后移后继（各块时长不变），
+ *     区间外字幕绝不移动；校正链越过区间出点或挤占区间外字幕时整次失败，
+ *     返回可定位的冲突列表，不修改任何字幕。
  */
 (function (root, factory) {
   const api = factory();
@@ -297,6 +304,151 @@
     return cues;
   }
 
+  /* ---------------- 读速校正 ---------------- */
+
+  /**
+   * 统计读速字符数：去除全部空白后的 Unicode 字符数（按码点计数，
+   * CJK / Emoji 等均按 1 计）。空白包含空格、制表换行、全角空格等。
+   */
+  function countReadingChars(text) {
+    const stripped = String(text == null ? '' : text).replace(/\s/g, '');
+    let n = 0;
+    // eslint-disable-next-line no-unused-vars
+    for (const ch of stripped) n++; // for...of 按码点迭代，代理对计为 1
+    return n;
+  }
+
+  /**
+   * 规划读速校正（纯函数，不修改 cues）。
+   *
+   * 处理区间为 [inMs, outMs]，凡与区间相交（含跨越边界）的字幕都纳入处理链；
+   * 按“去除空白后的 Unicode 字符数 / maxCps”逐条计算所需时长（至少 500ms，
+   * 毫秒向上取整）：不改文本、不改起点，仅延长过快字幕的终点；
+   * 延长造成的挤占只在链内递归后移后继（各块时长不变），区间外字幕不移动。
+   * 若链条越过 outMs（越过区间出点）或与区间外后继间隔不足 100ms
+   * （挤占区间外字幕），则整次失败，返回可点击定位的冲突，不做任何修改。
+   *
+   * @param cues
+   * @param inMs   处理区间入点（ms，>=0）
+   * @param outMs  处理区间出点（ms，>inMs），不可越过的硬边界
+   * @param maxCps 每秒最大字符数（>0，可小数）
+   * @returns 成功 { ok:true, inMs, outMs, maxCps, affected:[下标], changed:[下标],
+   *                 totalExtensionMs,
+   *                 details:[{index,start,end,oldStart,oldEnd,chars,
+   *                           beforeCps,afterCps,extensionMs,extended,pushed}] }
+   *          失败 { ok:false, reason } 或 { ok:false, conflicts:[{index,message}] }
+   */
+  function planReadingSpeed(cues, inMs, outMs, maxCps) {
+    inMs = Math.round(inMs);
+    outMs = Math.round(outMs);
+    maxCps = Number(maxCps);
+    if (!(inMs >= 0)) return { ok: false, reason: '入点不能为负' };
+    if (!(outMs > inMs)) return { ok: false, reason: '出点必须大于入点' };
+    if (!(maxCps > 0) || !Number.isFinite(maxCps)) {
+      return { ok: false, reason: '每秒最大字符数必须是大于 0 的数字' };
+    }
+    if (!cues.length) return { ok: false, reason: '当前没有字幕' };
+
+    // 处理链：与区间相交（含跨越边界）的字幕；已排序时间轴上必为连续段
+    const affected = [];
+    cues.forEach((c, i) => { if (c.start < outMs && c.end > inMs) affected.push(i); });
+    if (!affected.length) return { ok: false, reason: '区间内没有字幕' };
+
+    // 先按读速延长过快字幕（起点、文本不变），所需时长至少 MIN_DURATION_MS
+    const next = cues.map(c => ({ start: c.start, end: c.end }));
+    const charsOf = cues.map(c => countReadingChars(c.text));
+    for (const i of affected) {
+      const needMs = Math.max(MIN_DURATION_MS, Math.ceil(charsOf[i] / maxCps * 1000));
+      if (next[i].end < next[i].start + needMs) next[i].end = next[i].start + needMs;
+    }
+    // 再在链内递归后移后继：间隔不足 100ms 时整块平移（保持时长），
+    // 不向区间外传播；链首起点不动（与区间外前驱的间隔维持原状）
+    for (let k = 1; k < affected.length; k++) {
+      const prev = next[affected[k - 1]];
+      const cur = next[affected[k]];
+      const minStart = prev.end + MIN_GAP_MS;
+      if (cur.start < minStart) {
+        cur.end += minStart - cur.start;
+        cur.start = minStart;
+      }
+    }
+
+    // 冲突一：链条越过区间出点（只报最早越过的一条）。
+    // 原本就跨越出点且本次未再后移的字幕不算冲突。
+    let wallIdx = -1;
+    for (const i of affected) {
+      if (next[i].end > outMs && next[i].end > cues[i].end) { wallIdx = i; break; }
+    }
+    if (wallIdx >= 0) {
+      return {
+        ok: false,
+        conflicts: [{
+          index: wallIdx,
+          message: '第 ' + (wallIdx + 1) + ' 条校正后终点 ' + msToTimecode(next[wallIdx].end) +
+            ' 越过区间出点 ' + msToTimecode(outMs) +
+            '（区间内放不下所需时长），请调大每秒最大字符数、扩大处理区间或先手动修整',
+        }],
+      };
+    }
+
+    // 冲突二：链尾与区间外后继（其起点 >= 出点）间隔不足 100ms（挤占区间外字幕）
+    const conflicts = [];
+    const last = affected[affected.length - 1];
+    if (last < cues.length - 1) {
+      const outside = cues[last + 1];
+      if (outside.start - next[last].end < MIN_GAP_MS) {
+        conflicts.push({
+          index: last + 1,
+          message: '第 ' + (last + 2) + ' 条（区间外，起点 ' + msToTimecode(outside.start) +
+            '）与校正后第 ' + (last + 1) + ' 条（终点 ' + msToTimecode(next[last].end) +
+            '）间隔不足 ' + MIN_GAP_MS + 'ms，校正会挤占区间外字幕；' +
+            '请调大每秒最大字符数、扩大处理区间或先手动修整',
+        });
+      }
+    }
+    if (conflicts.length) return { ok: false, conflicts, affected };
+
+    // 汇总逐条前后读速与延长量
+    const details = [];
+    const changed = [];
+    let totalExtensionMs = 0;
+    for (const i of affected) {
+      const oldDur = cues[i].end - cues[i].start;
+      const newDur = next[i].end - next[i].start;
+      const extensionMs = newDur - oldDur;
+      const pushed = next[i].start !== cues[i].start;
+      const extended = extensionMs > 0;
+      if (next[i].start !== cues[i].start || next[i].end !== cues[i].end) changed.push(i);
+      if (extensionMs > 0) totalExtensionMs += extensionMs;
+      const cps = (chars, durMs) => durMs > 0 ? chars / (durMs / 1000) : 0;
+      details.push({
+        index: i,
+        start: next[i].start,
+        end: next[i].end,
+        oldStart: cues[i].start,
+        oldEnd: cues[i].end,
+        chars: charsOf[i],
+        beforeCps: cps(charsOf[i], oldDur),
+        afterCps: cps(charsOf[i], newDur),
+        extensionMs,
+        extended,
+        pushed,
+      });
+    }
+
+    return {
+      ok: true,
+      inMs,
+      outMs,
+      maxCps,
+      affected,
+      changed,
+      totalExtensionMs,
+      changes: affected.map(i => ({ index: i, start: next[i].start, end: next[i].end })),
+      details,
+    };
+  }
+
   /* ---------------- 帧对齐 ---------------- */
 
   /** 可选帧率（fps）与帧周期（ms）。23.976/29.97 按 NTSC 丢帧前精确比率。 */
@@ -503,6 +655,8 @@
     applyMove,
     planRetime,
     applyPlan,
+    countReadingChars,
+    planReadingSpeed,
     planFrameAlign,
     validate,
   };

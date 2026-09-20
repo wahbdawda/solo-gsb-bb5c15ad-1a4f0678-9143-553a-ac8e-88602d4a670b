@@ -394,3 +394,66 @@ td.delta-zero { color: #6b7086; }
 }
 
 tbody tr.frame-affected { background: rgba(63, 185, 80, 0.08); }
+
+/* ---------- 读速校正 ---------- */
+
+#speed-panel {
+  flex: none;
+  max-height: 42%;
+  padding: 8px 16px;
+  background: #1a1c26;
+  border-bottom: 1px solid #2c2f3c;
+  overflow: auto;
+}
+
+#speed-panel:not([hidden]) { display: flex; flex-direction: column; }
+
+#speed-info {
+  margin-top: 6px;
+  font-size: 12px;
+  color: #8fd18f;
+}
+
+#speed-info.warn { color: #f0b35e; }
+
+#speed-conflicts {
+  margin: 4px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+#speed-conflicts li {
+  color: #f0b35e;
+  font-size: 12px;
+  cursor: pointer;
+  padding: 2px 0;
+}
+
+#speed-conflicts li:hover { text-decoration: underline; }
+
+#speed-preview {
+  margin-top: 8px;
+  overflow: auto;
+  border: 1px solid #2c2f3c;
+  border-radius: 6px;
+}
+
+#speed-preview table { font-size: 12px; }
+
+#speed-preview th, #speed-preview td { padding: 4px 8px; }
+
+#speed-preview tbody tr.speed-row-changed { background: rgba(63, 185, 80, 0.08); }
+
+/* 区间内参与处理的字幕：青色描边；实际被延长/后移的：加强阴影 */
+.block.speed-affected {
+  border-color: #39c5cf;
+  box-shadow: 0 0 0 1px #39c5cf;
+}
+
+.block.speed-changed {
+  border-color: #3fb950;
+  box-shadow: 0 0 0 1px #3fb950;
+}
+
+tbody tr.speed-affected { background: rgba(57, 197, 207, 0.06); }
+tbody tr.speed-changed.speed-affected { background: rgba(63, 185, 80, 0.08); }
