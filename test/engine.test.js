@@ -298,6 +298,166 @@ test('区间变速：应用方案后整体合法且可导出回读', () => {
   assert.deepEqual(E.parseSrt(E.formatSrt(cues)), cues); // 导出可回读
 });
 
+/* ---------------- 读速校正 ---------------- */
+
+test('字符统计：去除空白（含换行/制表位），Unicode 码点计数', () => {
+  assert.equal(E.textCharCount('hello world'), 10);
+  assert.equal(E.textCharCount(' 你 好\n世界\t'), 4);
+  assert.equal(E.textCharCount('😀a b'), 3); // emoji 代理对算 1 个码点
+  assert.equal(E.textCharCount(''), 0);
+});
+
+test('读速校正：起点与文本不变，仅延长过快字幕，读速降到上限内', () => {
+  // 20 字 / 17 字每秒 -> 需要 ceil(20/17*1000)=1177ms
+  const cues = [cue(0, 1000, '一二三四五六七八九十一二三四五六七八九十')];
+  const plan = E.planReadSpeed(cues, 0, 5000, 17);
+  assert.equal(plan.ok, true);
+  assert.deepEqual(plan.affected, [0]);
+  assert.equal(plan.extendedCount, 1);
+  assert.equal(plan.totalAddedMs, 177);
+  assert.deepEqual([plan.changes[0].start, plan.changes[0].end], [0, 1177]);
+  assert.equal(plan.changes[0].chars, 20);
+  assert.ok(Math.abs(plan.changes[0].afterCps - 20 / 1.177) < 1e-9);
+  E.applyPlan(cues, plan);
+  assert.deepEqual([cues[0].start, cues[0].end], [0, 1177]);
+  assert.equal(cues[0].text, '一二三四五六七八九十一二三四五六七八九十'); // 文本不变
+  assert.deepEqual(E.validate(cues), []);
+});
+
+test('读速校正：纯函数，规划不修改输入', () => {
+  const cues = [cue(0, 1000, '一二三四五六七八九十一二三四五六七八九十')];
+  const before = JSON.parse(JSON.stringify(cues));
+  E.planReadSpeed(cues, 0, 5000, 17);
+  assert.deepEqual(cues, before);
+});
+
+test('读速校正：足够慢的字幕不改动，延长量为 0', () => {
+  const cues = [cue(0, 2000, '一二三四五')]; // 5 字需 294ms，已有 2000ms
+  const plan = E.planReadSpeed(cues, 0, 5000, 17);
+  assert.equal(plan.ok, true);
+  assert.equal(plan.extendedCount, 0);
+  assert.equal(plan.totalAddedMs, 0);
+  assert.equal(plan.changes[0].addedMs, 0);
+  E.applyPlan(cues, plan);
+  assert.deepEqual([cues[0].start, cues[0].end], [0, 2000]);
+});
+
+test('读速校正：始终不短于 500ms（所需时长夹取下限）', () => {
+  const cues = [cue(0, 300, '字')];
+  const plan = E.planReadSpeed(cues, 0, 5000, 17);
+  assert.equal(plan.ok, true);
+  assert.deepEqual([plan.changes[0].start, plan.changes[0].end], [0, 500]);
+  assert.equal(plan.changes[0].addedMs, 200);
+});
+
+test('读速校正：延长后间隔不足时，区间内后继整体后移并保持时长，连锁递归', () => {
+  // 20 字需 1177ms：第一条 0..1000 -> 0..1177；第二条原 1200..1800（600 时长）被后移
+  const cues = [
+    cue(0, 1000, '一二三四五六七八九十一二三四五六七八九十'),
+    cue(1200, 1800, '短'),
+    cue(1900, 2500, '短'),
+  ];
+  const plan = E.planReadSpeed(cues, 0, 9000, 17);
+  assert.equal(plan.ok, true);
+  E.applyPlan(cues, plan);
+  assert.deepEqual(cues.map(c => [c.start, c.end]), [
+    [0, 1177],
+    [1277, 1877], // 间隔不足，整体后移 77，时长 600 不变
+    [1977, 2577], // 连锁后移 77
+  ]);
+  assert.deepEqual(E.validate(cues), []);
+  assert.equal(plan.totalAddedMs, 177 + 77 + 77); // 终点总后移量
+});
+
+test('读速校正：递归后移在空隙足够处停止', () => {
+  const cues = [
+    cue(0, 1000, '一二三四五六七八九十一二三四五六七八九十'), // -> 1177
+    cue(1200, 1800, '短'),
+    cue(5000, 5600, '远'),
+  ];
+  const plan = E.planReadSpeed(cues, 0, 9000, 17);
+  assert.equal(plan.ok, true);
+  E.applyPlan(cues, plan);
+  assert.deepEqual(cues.map(c => [c.start, c.end]), [
+    [0, 1177],
+    [1277, 1877],
+    [5000, 5600], // 空隙足够，不动
+  ]);
+});
+
+test('读速校正：只处理起点在区间内的字幕，区间外字幕不动', () => {
+  const cues = [
+    cue(0, 1000, '一二三四五六七八九十一二三四五六七八九十'), // 区间外（起点 < 入点）
+    cue(2000, 2100, '一二三四五六七八九十一二三四五六七八九十'), // 区间内 -> 3177
+  ];
+  const plan = E.planReadSpeed(cues, 1500, 9000, 17);
+  assert.equal(plan.ok, true);
+  assert.deepEqual(plan.affected, [1]);
+  E.applyPlan(cues, plan);
+  assert.deepEqual(cues.map(c => [c.start, c.end]), [[0, 1000], [2000, 3177]]);
+});
+
+test('读速校正：延长越过区间出点 -> 整次预览失败、可定位冲突、不修改输入', () => {
+  const cues = [cue(0, 1000, '一二三四五六七八九十一二三四五六七八九十')]; // 需 1177
+  const before = JSON.parse(JSON.stringify(cues));
+  const plan = E.planReadSpeed(cues, 0, 1100, 17);
+  assert.equal(plan.ok, false);
+  assert.equal(plan.conflicts.length, 1);
+  assert.equal(plan.conflicts[0].index, 0);
+  assert.match(plan.conflicts[0].message, /越过区间出点/);
+  assert.deepEqual(cues, before);
+});
+
+test('读速校正：递归后移挤占区间外字幕 -> 冲突且不改动', () => {
+  const cues = [
+    cue(0, 1000, '一二三四五六七八九十一二三四五六七八九十'), // -> 1177
+    cue(1200, 1800, '短'), // 在区间内，会被后移到 1277..1877
+    cue(1950, 2500, '区间外'), // 起点 1950 >= 出点 1900，间隔 1950-1877=73 < 100
+  ];
+  const before = JSON.parse(JSON.stringify(cues));
+  const plan = E.planReadSpeed(cues, 0, 1900, 17);
+  assert.equal(plan.ok, false);
+  assert.equal(plan.conflicts.length, 1);
+  assert.equal(plan.conflicts[0].index, 2); // 定位到区间外那条
+  assert.match(plan.conflicts[0].message, /第 3 条/);
+  assert.match(plan.conflicts[0].message, /挤占/);
+  assert.deepEqual(cues, before);
+});
+
+test('读速校正：原本伸出出点但未被改动的字幕不算冲突', () => {
+  const cues = [cue(0, 3000, '慢字幕不需要延长')]; // 9 字需 530ms
+  const plan = E.planReadSpeed(cues, 0, 2000, 17);
+  assert.equal(plan.ok, true);
+  assert.equal(plan.changes[0].addedMs, 0);
+});
+
+test('读速校正：参数错误与空区间', () => {
+  const cues = [cue(0, 1000, '字')];
+  assert.match(E.planReadSpeed(cues, -5, 1000, 17).reason, /入点不能为负/);
+  assert.match(E.planReadSpeed(cues, 3000, 2000, 17).reason, /出点必须大于入点/);
+  assert.match(E.planReadSpeed(cues, 0, 1000, 0).reason, /每秒最大字符数/);
+  assert.match(E.planReadSpeed(cues, 0, 1000, -3).reason, /每秒最大字符数/);
+  assert.match(E.planReadSpeed(cues, 0, 1000, NaN).reason, /每秒最大字符数/);
+  assert.match(E.planReadSpeed(cues, 5000, 6000, 17).reason, /区间内没有字幕/);
+  assert.match(E.planReadSpeed([], 0, 1000, 17).reason, /当前没有字幕/);
+});
+
+test('读速校正：应用后整体合法、可导出回读且可撤销恢复', () => {
+  const cues = E.normalize(E.parseSrt([
+    '1', '00:00:00,000 --> 00:00:01,000', '一二三四五六七八九十一二三四五六七八九十', '',
+    '2', '00:00:01,200 --> 00:00:02,000', '短', '',
+  ].join('\n')));
+  const backup = cues.map(c => ({ start: c.start, end: c.end }));
+  const plan = E.planReadSpeed(cues, 0, 9000, 17);
+  assert.equal(plan.ok, true);
+  E.applyPlan(cues, plan);
+  assert.deepEqual(E.validate(cues), []);
+  assert.deepEqual(E.parseSrt(E.formatSrt(cues)), cues);
+  // 一条撤销记录即可整体回退
+  cues.forEach((c, i) => { c.start = backup[i].start; c.end = backup[i].end; });
+  assert.deepEqual(cues.map(c => [c.start, c.end]), [[0, 1000], [1200, 2000]]);
+});
+
 /* ---------------- 帧对齐 ---------------- */
 
 test('帧周期：五种帧率与非法标签', () => {

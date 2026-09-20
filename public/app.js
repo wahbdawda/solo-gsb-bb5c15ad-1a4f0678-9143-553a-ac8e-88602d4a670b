@@ -5,7 +5,7 @@
   const {
     MIN_DURATION_MS, MIN_GAP_MS,
     msToTimecode, parseTimeInput, parseSrt, formatSrt, normalize,
-    applyDrag, applyMove, planRetime, applyPlan, planFrameAlign, validate,
+    applyDrag, applyMove, planRetime, applyPlan, planFrameAlign, planReadSpeed, validate,
   } = SubEngine;
 
   const MIN_PPS = 10;    // 像素/秒，缩放范围
@@ -20,7 +20,9 @@
     drag: null,        // {index, edge: 'start'|'end'|'move', moved, grabOffset, el, snapshot}
     retime: null,      // 变速预览中 {plan, backup, affectedSet}
     frameAlign: null,  // 帧对齐预览中 {plan, backup, affectedSet}
+    readSpeed: null,   // 读速校正预览中 {plan, backup, affectedSet}
     rangeOverlay: null,// 时间轴区间覆盖层 {fromMs, toMs, preview}
+    rangeOwner: null,  // 区间覆盖层来源面板：'retime' | 'readspeed' | null
     fileName: 'edited.srt',
   };
 
@@ -81,18 +83,23 @@
     while (rowEls.length > state.cues.length) listBody.removeChild(rowEls.pop());
   }
 
+  function activePreview() {
+    return state.retime || state.frameAlign || state.readSpeed || null;
+  }
+
   function updateBlocks(from) {
     const pps = state.pxPerSec;
-    const affected = state.retime
-      ? state.retime.affectedSet
-      : (state.frameAlign ? state.frameAlign.affectedSet : null);
+    const preview = activePreview();
+    const affected = preview ? preview.affectedSet : null;
     for (let i = Math.max(0, from); i < state.cues.length; i++) {
       const c = state.cues[i];
       const el = blockEls[i];
       el.style.left = (c.start / 1000 * pps) + 'px';
       el.style.width = ((c.end - c.start) / 1000 * pps) + 'px';
-      el.classList.toggle('retime-affected', !!state.retime && affected.has(i));
+      el.classList.toggle('retime-affected',
+        (!!state.retime || !!state.readSpeed) && affected.has(i));
       el.classList.toggle('frame-affected', !!state.frameAlign && affected.has(i));
+      el.classList.toggle('readspeed-affected', !!state.readSpeed && affected.has(i));
       el.querySelector('.block-time').textContent =
         msToTimecode(c.start) + ' → ' + msToTimecode(c.end);
       const textEl = el.querySelector('.block-text');
@@ -101,9 +108,8 @@
   }
 
   function updateRows(from) {
-    const affected = state.retime
-      ? state.retime.affectedSet
-      : (state.frameAlign ? state.frameAlign.affectedSet : null);
+    const preview = activePreview();
+    const affected = preview ? preview.affectedSet : null;
     for (let i = Math.max(0, from); i < state.cues.length; i++) {
       const c = state.cues[i];
       const td = rowEls[i].children;
@@ -112,8 +118,10 @@
       td[2].textContent = msToTimecode(c.end);
       td[3].textContent = ((c.end - c.start) / 1000).toFixed(3) + 's';
       if (td[4].textContent !== c.text) td[4].textContent = c.text;
-      rowEls[i].classList.toggle('retime-affected', !!state.retime && affected.has(i));
+      rowEls[i].classList.toggle('retime-affected',
+        (!!state.retime || !!state.readSpeed) && affected.has(i));
       rowEls[i].classList.toggle('frame-affected', !!state.frameAlign && affected.has(i));
+      rowEls[i].classList.toggle('readspeed-affected', !!state.readSpeed && affected.has(i));
     }
   }
 
@@ -156,7 +164,7 @@
 
   function updateUndoButton() {
     const btn = $('#btn-undo');
-    const previewing = !!state.retime || !!state.frameAlign;
+    const previewing = !!state.retime || !!state.frameAlign || !!state.readSpeed;
     btn.disabled = state.undoStack.length === 0 || previewing; // 预览期间禁止撤销
     btn.textContent = state.undoStack.length ? '撤销 (' + state.undoStack.length + ')' : '撤销';
   }
@@ -221,7 +229,7 @@
   /* ---------------- 拖动 ---------------- */
 
   trackEl.addEventListener('pointerdown', (e) => {
-    if (state.retime || state.frameAlign) return; // 预览期间禁止拖动
+    if (state.retime || state.frameAlign || state.readSpeed) return; // 预览期间禁止拖动
     const blockEl = e.target.closest('.block');
     if (!blockEl) return;
     const index = Number(blockEl.dataset.i);
@@ -279,7 +287,7 @@
   /* ---------------- 撤销 ---------------- */
 
   function undo() {
-    if (state.retime || state.frameAlign) return; // 预览期间禁止撤销
+    if (state.retime || state.frameAlign || state.readSpeed) return; // 预览期间禁止撤销
     const snap = state.undoStack.pop();
     if (!snap) return;
     state.cues.forEach((c, i) => { c.start = snap[i].start; c.end = snap[i].end; });
@@ -296,6 +304,8 @@
       cancelRetime(); // Esc 取消变速预览
     } else if (e.key === 'Escape' && state.frameAlign) {
       cancelFrameAlign(); // Esc 取消帧对齐预览
+    } else if (e.key === 'Escape' && state.readSpeed) {
+      cancelReadSpeed(); // Esc 取消读速校正预览
     }
   });
 
@@ -354,18 +364,48 @@
     rangeOverlay.classList.toggle('preview', !!r.preview);
   }
 
-  // 输入入点/出点时实时标出所选区间（预览中则保持显示目标区间）
+  // 输入入点/出点时实时标出所选区间（预览中则保持显示预览区间）
   function updateRangeOverlayFromInputs() {
-    if (state.retime) return;
-    const { inMs, outMs } = readRetimeParams();
-    state.rangeOverlay = (inMs != null && outMs != null && outMs > inMs)
-      ? { fromMs: inMs, toMs: outMs, preview: false }
+    const owner = state.rangeOwner;
+    if (state.retime || state.readSpeed) return; // 预览中由预览逻辑设置覆盖层
+    let fromMs = null;
+    let toMs = null;
+    if (owner === 'retime') {
+      fromMs = parseTimeInput(retimeIn.value);
+      toMs = parseTimeInput(retimeOut.value);
+    } else if (owner === 'readspeed') {
+      fromMs = parseTimeInput(readspeedIn.value);
+      toMs = parseTimeInput(readspeedOut.value);
+    }
+    state.rangeOverlay = (fromMs != null && toMs != null && toMs > fromMs)
+      ? { fromMs, toMs, preview: false }
       : null;
     positionRangeOverlay();
   }
 
-  function setPreviewUi() {
-    syncFrameControls(); // 两个面板互斥，控件状态统一由 syncFrameControls 同步
+  // 三个功能面板互斥：任一方预览中时锁定另外两方的全部入口；同时锁定拖动、撤销与导出
+  function syncControls() {
+    const framePreviewing = !!state.frameAlign;
+    const retimePreviewing = !!state.retime;
+    const readPreviewing = !!state.readSpeed;
+    const anyPreview = framePreviewing || retimePreviewing || readPreviewing;
+    btnFramePreview.disabled = anyPreview || !state.cues.length;
+    btnFrameApply.disabled = !framePreviewing;
+    btnFrameCancel.disabled = !framePreviewing;
+    frameFps.disabled = frameTolerance.disabled = framePreviewing;
+    btnRetimePreview.disabled = anyPreview || !state.cues.length;
+    btnRetimeApply.disabled = !retimePreviewing;
+    btnRetimeCancel.disabled = !retimePreviewing;
+    retimeIn.disabled = retimeOut.disabled = retimeTarget.disabled = retimePreviewing;
+    btnReadSpeedPreview.disabled = anyPreview || !state.cues.length;
+    btnReadSpeedApply.disabled = !readPreviewing;
+    btnReadSpeedCancel.disabled = !readPreviewing;
+    readspeedIn.disabled = readspeedOut.disabled = readspeedCps.disabled = readPreviewing;
+    $('#btn-retime').disabled = framePreviewing || readPreviewing;
+    btnFrame.disabled = retimePreviewing || readPreviewing;
+    btnReadSpeed.disabled = retimePreviewing || framePreviewing;
+    $('#btn-export').disabled = anyPreview || !state.cues.length;
+    updateUndoButton();
   }
 
   function openRetimePanel() {
@@ -383,8 +423,9 @@
     retimeOut.value = msToTimecode(outMs);
     retimeTarget.value = ((outMs - inMs) / 1000).toFixed(3);
     clearConflicts();
-    setPreviewUi(false);
+    syncControls();
     setRetimeInfo('设置入点、出点与目标时长后点击「预览」（时间支持 秒 / MM:SS,mmm / HH:MM:SS,mmm）', false);
+    state.rangeOwner = 'retime';
     updateRangeOverlayFromInputs();
   }
 
@@ -392,6 +433,7 @@
     if (state.retime) cancelRetime(); // 收起面板视同取消预览
     retimePanel.hidden = true;
     state.rangeOverlay = null;
+    state.rangeOwner = null;
     positionRangeOverlay();
     clearConflicts();
   }
@@ -400,14 +442,15 @@
   function resetRetime() {
     state.retime = null;
     state.rangeOverlay = null;
+    state.rangeOwner = null;
     retimePanel.hidden = true;
     clearConflicts();
-    setPreviewUi(false);
+    syncControls();
     positionRangeOverlay();
   }
 
   function previewRetime() {
-    if (state.retime || state.frameAlign || !state.cues.length) return;
+    if (state.retime || state.frameAlign || state.readSpeed || !state.cues.length) return;
     clearConflicts();
     const { inMs, outMs, targetMs } = readRetimeParams();
     if (inMs == null || outMs == null || targetMs == null) {
@@ -433,7 +476,7 @@
     };
     applyPlan(state.cues, plan);
     state.rangeOverlay = { fromMs: plan.inMs, toMs: plan.newOutMs, preview: true };
-    setPreviewUi(true);
+    syncControls();
     setRetimeInfo(
       '预览中：锚点 ' + msToTimecode(plan.inMs) + ' 不动，缩放 ×' + plan.scale.toFixed(3) +
       '，影响第 ' + (plan.affected[0] + 1) + '–' + (plan.affected[plan.affected.length - 1] + 1) +
@@ -446,7 +489,7 @@
     const backup = state.retime.backup;
     state.cues.forEach((c, i) => { c.start = backup[i].start; c.end = backup[i].end; });
     state.retime = null;
-    setPreviewUi(false);
+    syncControls();
     setRetimeInfo('已取消预览，未修改任何字幕。', false);
     updateRangeOverlayFromInputs();
     renderAll();
@@ -458,7 +501,7 @@
     if (state.undoStack.length > UNDO_LIMIT) state.undoStack.shift();
     state.retime = null;
     state.rangeOverlay = null;
-    setPreviewUi(false);
+    syncControls();
     updateUndoButton();
     setRetimeInfo('已应用区间变速。可用「撤销」或 Ctrl+Z 回退。', false);
     renderAll();
@@ -520,35 +563,17 @@
     return { fpsLabel: frameFps.value, toleranceMs };
   }
 
-  // 两个面板互斥：任一方预览中时锁定另一方的全部入口；同时锁定拖动、撤销与导出
-  function syncFrameControls() {
-    const framePreviewing = !!state.frameAlign;
-    const retimePreviewing = !!state.retime;
-    btnFramePreview.disabled = framePreviewing || retimePreviewing || !state.cues.length;
-    btnFrameApply.disabled = !framePreviewing;
-    btnFrameCancel.disabled = !framePreviewing;
-    frameFps.disabled = frameTolerance.disabled = framePreviewing;
-    btnRetimePreview.disabled = retimePreviewing || framePreviewing || !state.cues.length;
-    btnRetimeApply.disabled = !retimePreviewing;
-    btnRetimeCancel.disabled = !retimePreviewing;
-    retimeIn.disabled = retimeOut.disabled = retimeTarget.disabled = retimePreviewing;
-    $('#btn-retime').disabled = framePreviewing;
-    btnFrame.disabled = retimePreviewing;
-    $('#btn-export').disabled = framePreviewing || retimePreviewing || !state.cues.length;
-    updateUndoButton();
-  }
-
   function openFramePanel() {
     if (!state.cues.length) {
       statusEl.textContent = '⚠ 请先导入字幕，再使用帧对齐';
       statusEl.classList.add('warn');
       return;
     }
-    if (state.retime) return; // 变速预览中不允许打开（入口按钮已禁用）
+    if (state.retime || state.readSpeed) return; // 其他预览中不允许打开（入口按钮已禁用）
     framePanel.hidden = false;
     clearFrameConflicts();
     framePreviewWrap.hidden = true;
-    syncFrameControls();
+    syncControls();
     setFrameInfo('选择帧率并设置单点最大允许偏移（ms），点击「预览」查看全局最优帧对齐方案', false);
   }
 
@@ -566,7 +591,7 @@
     clearFrameConflicts();
     framePreviewWrap.hidden = true;
     framePreviewBody.textContent = '';
-    syncFrameControls();
+    syncControls();
   }
 
   function deltaText(d) {
@@ -611,7 +636,7 @@
   }
 
   function previewFrameAlign() {
-    if (state.frameAlign || state.retime || !state.cues.length) return;
+    if (state.frameAlign || state.retime || state.readSpeed || !state.cues.length) return;
     clearFrameConflicts();
     const { fpsLabel, toleranceMs } = readFrameParams();
     if (toleranceMs == null) {
@@ -639,7 +664,7 @@
     };
     applyPlan(state.cues, plan);
     renderFramePreviewTable(plan);
-    syncFrameControls();
+    syncControls();
     const moved = plan.changes.filter(ch => ch.startDelta !== 0 || ch.endDelta !== 0).length;
     setFrameInfo(
       '预览中：' + fpsLabel + ' fps（帧周期 ' + plan.frameMs.toFixed(3) +
@@ -654,7 +679,7 @@
     const backup = state.frameAlign.backup;
     state.cues.forEach((c, i) => { c.start = backup[i].start; c.end = backup[i].end; });
     state.frameAlign = null;
-    syncFrameControls();
+    syncControls();
     framePreviewWrap.hidden = true;
     framePreviewBody.textContent = '';
     setFrameInfo('已取消预览，未修改任何字幕。', false);
@@ -667,7 +692,7 @@
     if (state.undoStack.length > UNDO_LIMIT) state.undoStack.shift();
     const plan = state.frameAlign.plan;
     state.frameAlign = null;
-    syncFrameControls();
+    syncControls();
     framePreviewWrap.hidden = true;
     framePreviewBody.textContent = '';
     updateUndoButton();
@@ -686,6 +711,220 @@
   frameTolerance.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') previewFrameAlign();
   });
+
+  /* ---------------- 读速校正 ---------------- */
+
+  const readspeedPanel = $('#readspeed-panel');
+  const readspeedIn = $('#readspeed-in');
+  const readspeedOut = $('#readspeed-out');
+  const readspeedCps = $('#readspeed-cps');
+  const readspeedInfo = $('#readspeed-info');
+  const readspeedConflictsEl = $('#readspeed-conflicts');
+  const readspeedPreviewWrap = $('#readspeed-preview');
+  const readspeedPreviewBody = $('#readspeed-preview-body');
+  const btnReadSpeed = $('#btn-readspeed');
+  const btnReadSpeedPreview = $('#btn-readspeed-preview');
+  const btnReadSpeedApply = $('#btn-readspeed-apply');
+  const btnReadSpeedCancel = $('#btn-readspeed-cancel');
+  const btnReadSpeedClose = $('#btn-readspeed-close');
+
+  function setReadSpeedInfo(msg, warn) {
+    readspeedInfo.textContent = msg;
+    readspeedInfo.classList.toggle('warn', !!warn);
+  }
+
+  function clearReadSpeedConflicts() {
+    readspeedConflictsEl.textContent = '';
+  }
+
+  function showReadSpeedConflicts(conflicts) {
+    clearReadSpeedConflicts();
+    for (const c of conflicts) {
+      const li = document.createElement('li');
+      li.textContent = '⚠ ' + c.message + '（点击定位）';
+      li.addEventListener('click', () => {
+        selectCue(c.index);
+        scrollBlockIntoView(c.index);
+      });
+      readspeedConflictsEl.appendChild(li);
+    }
+  }
+
+  function readReadSpeedParams() {
+    return {
+      inMs: parseTimeInput(readspeedIn.value),
+      outMs: parseTimeInput(readspeedOut.value),
+      maxCps: Number(String(readspeedCps.value).trim()),
+    };
+  }
+
+  function openReadSpeedPanel() {
+    if (!state.cues.length) {
+      statusEl.textContent = '⚠ 请先导入字幕，再使用读速校正';
+      statusEl.classList.add('warn');
+      return;
+    }
+    if (state.retime || state.frameAlign) return; // 其他预览中不允许打开（入口按钮已禁用）
+    readspeedPanel.hidden = false;
+    // 默认处理区间取选中字幕范围，未选中则为整个时间轴
+    const sel = state.cues[state.selected];
+    const inMs = sel ? sel.start : 0;
+    const outMs = sel ? sel.end : state.cues[state.cues.length - 1].end;
+    readspeedIn.value = msToTimecode(inMs);
+    readspeedOut.value = msToTimecode(outMs);
+    clearReadSpeedConflicts();
+    readspeedPreviewWrap.hidden = true;
+    readspeedPreviewBody.textContent = '';
+    syncControls();
+    setReadSpeedInfo('设置处理区间与每秒最大字符数（按去除空白后的 Unicode 字符数计），点击「预览」查看逐条读速', false);
+    state.rangeOwner = 'readspeed';
+    updateRangeOverlayFromInputs();
+  }
+
+  function closeReadSpeedPanel() {
+    if (state.readSpeed) cancelReadSpeed(); // 收起面板视同取消预览
+    readspeedPanel.hidden = true;
+    clearReadSpeedConflicts();
+    readspeedPreviewWrap.hidden = true;
+    state.rangeOverlay = null;
+    state.rangeOwner = null;
+    positionRangeOverlay();
+  }
+
+  // 导入新文件时调用：丢弃预览状态（字幕已被整体替换，无需恢复备份）
+  function resetReadSpeed() {
+    state.readSpeed = null;
+    readspeedPanel.hidden = true;
+    clearReadSpeedConflicts();
+    readspeedPreviewWrap.hidden = true;
+    readspeedPreviewBody.textContent = '';
+    state.rangeOverlay = null;
+    state.rangeOwner = null;
+    syncControls();
+    positionRangeOverlay();
+  }
+
+  // 预览逐条显示校正前后读速（字/秒）与终点延长量，点击行可定位
+  function renderReadSpeedPreviewTable(plan) {
+    readspeedPreviewBody.textContent = '';
+    const frag = document.createDocumentFragment();
+    const cpsText = (v) => (v > 0 ? v.toFixed(1) : '—');
+    plan.changes.forEach(ch => {
+      const before = state.readSpeed.backup[ch.index];
+      const tr = document.createElement('tr');
+      const tdIdx = document.createElement('td');
+      const tdChars = document.createElement('td');
+      const tdBefore = document.createElement('td');
+      const tdAfter = document.createElement('td');
+      const tdBeforeCps = document.createElement('td');
+      const tdAfterCps = document.createElement('td');
+      const tdAdded = document.createElement('td');
+      const tdText = document.createElement('td');
+      tdIdx.textContent = ch.index + 1;
+      tdChars.textContent = ch.chars;
+      tdBefore.textContent = msToTimecode(before.start) + ' → ' + msToTimecode(before.end);
+      tdAfter.textContent = msToTimecode(ch.start) + ' → ' + msToTimecode(ch.end);
+      tdBeforeCps.textContent = cpsText(ch.beforeCps);
+      tdAfterCps.textContent = cpsText(ch.afterCps);
+      tdAdded.textContent = ch.addedMs > 0 ? '+' + ch.addedMs + 'ms' : '0';
+      tdAdded.className = ch.addedMs > 0 ? 'delta-pos' : 'delta-zero';
+      tdText.textContent = state.cues[ch.index].text;
+      tr.append(tdIdx, tdChars, tdBefore, tdAfter, tdBeforeCps, tdAfterCps, tdAdded, tdText);
+      tr.addEventListener('click', () => {
+        selectCue(ch.index);
+        scrollBlockIntoView(ch.index);
+      });
+      frag.appendChild(tr);
+    });
+    readspeedPreviewBody.appendChild(frag);
+    readspeedPreviewWrap.hidden = false;
+  }
+
+  function previewReadSpeed() {
+    if (state.readSpeed || state.retime || state.frameAlign || !state.cues.length) return;
+    clearReadSpeedConflicts();
+    const { inMs, outMs, maxCps } = readReadSpeedParams();
+    if (inMs == null || outMs == null) {
+      readspeedPreviewWrap.hidden = true;
+      setReadSpeedInfo('⚠ 时间格式无效：支持纯秒数（如 3.5）、MM:SS,mmm 或 HH:MM:SS,mmm', true);
+      return;
+    }
+    if (!(maxCps > 0) || !Number.isFinite(maxCps)) {
+      readspeedPreviewWrap.hidden = true;
+      setReadSpeedInfo('⚠ 每秒最大字符数必须是大于 0 的数字', true);
+      return;
+    }
+    const plan = planReadSpeed(state.cues, inMs, outMs, maxCps);
+    if (!plan.ok) {
+      readspeedPreviewWrap.hidden = true;
+      if (plan.conflicts) {
+        showReadSpeedConflicts(plan.conflicts);
+        setReadSpeedInfo('⚠ 存在 ' + plan.conflicts.length +
+          ' 处冲突，未修改任何字幕；点击上方冲突可定位，调大每秒字符数或区间出点后重新预览', true);
+      } else {
+        setReadSpeedInfo('⚠ ' + plan.reason, true);
+      }
+      return;
+    }
+    // 进入预览：备份现状并应用方案，「取消预览」可原样恢复
+    state.readSpeed = {
+      plan,
+      backup: state.cues.map(c => ({ start: c.start, end: c.end })),
+      affectedSet: new Set(plan.affected),
+    };
+    applyPlan(state.cues, plan);
+    renderReadSpeedPreviewTable(plan);
+    state.rangeOverlay = { fromMs: plan.inMs, toMs: plan.outMs, preview: true };
+    syncControls();
+    setReadSpeedInfo(
+      '预览中：上限 ' + maxCps + ' 字/秒 · 区间 ' + msToTimecode(plan.inMs) + '–' +
+      msToTimecode(plan.outMs) + ' · 共 ' + plan.changes.length + ' 条，其中 ' +
+      plan.extendedCount + ' 条被延长 · 总延长量 ' + plan.totalAddedMs +
+      'ms（起点与文本不变）。确认后点击「确认校正」（仅产生一条撤销记录），或「取消预览」(Esc) 恢复。', false);
+    renderAll();
+  }
+
+  function cancelReadSpeed() {
+    if (!state.readSpeed) return;
+    const backup = state.readSpeed.backup;
+    state.cues.forEach((c, i) => { c.start = backup[i].start; c.end = backup[i].end; });
+    state.readSpeed = null;
+    syncControls();
+    readspeedPreviewWrap.hidden = true;
+    readspeedPreviewBody.textContent = '';
+    setReadSpeedInfo('已取消预览，未修改任何字幕。', false);
+    updateRangeOverlayFromInputs();
+    renderAll();
+  }
+
+  function applyReadSpeed() {
+    if (!state.readSpeed) return;
+    state.undoStack.push(state.readSpeed.backup); // 一次校正只产生一条撤销记录
+    if (state.undoStack.length > UNDO_LIMIT) state.undoStack.shift();
+    const plan = state.readSpeed.plan;
+    state.readSpeed = null;
+    state.rangeOverlay = null;
+    syncControls();
+    readspeedPreviewWrap.hidden = true;
+    readspeedPreviewBody.textContent = '';
+    updateUndoButton();
+    setReadSpeedInfo('已完成读速校正：延长 ' + plan.extendedCount + ' 条，总延长量 ' +
+      plan.totalAddedMs + 'ms。可用「撤销」或 Ctrl+Z 回退。', false);
+    renderAll();
+  }
+
+  btnReadSpeed.addEventListener('click', () => {
+    if (readspeedPanel.hidden) openReadSpeedPanel(); else closeReadSpeedPanel();
+  });
+  btnReadSpeedClose.addEventListener('click', closeReadSpeedPanel);
+  btnReadSpeedPreview.addEventListener('click', previewReadSpeed);
+  btnReadSpeedApply.addEventListener('click', applyReadSpeed);
+  btnReadSpeedCancel.addEventListener('click', cancelReadSpeed);
+  readspeedIn.addEventListener('input', updateRangeOverlayFromInputs);
+  readspeedOut.addEventListener('input', updateRangeOverlayFromInputs);
+  [readspeedIn, readspeedOut, readspeedCps].forEach(el => el.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') previewReadSpeed();
+  }));
 
   /* ---------------- 缩放 ---------------- */
 
@@ -731,6 +970,7 @@
     }
     resetRetime(); // 新文件替换全部字幕，丢弃未确认的变速预览
     resetFrameAlign();
+    resetReadSpeed();
     state.cues = cues;
     state.fileName = name.replace(/\.[^.]*$/, '') + '.srt';
     state.undoStack = [];
@@ -788,7 +1028,8 @@
       '6', '00:00:11,300 --> 00:00:13,600', 'Ctrl+滚轮缩放时间轴，Ctrl+Z 撤销操作', '',
       '7', '00:00:13,900 --> 00:00:16,500', '「区间变速」设置入点、出点与目标时长，预览确认后应用', '',
       '8', '00:00:16,800 --> 00:00:19,200', '「帧对齐」可选 23.976/24/25/29.97/30fps，容差内全局最优吸附', '',
-      '9', '00:00:19,500 --> 00:00:21,800', '完成后点击「导出 SRT」保存合法字幕文件', '',
+      '9', '00:00:19,500 --> 00:00:20,300', '「读速校正」按每秒最大字符数延长过快字幕，起点文本不变', '',
+      '10', '00:00:21,300 --> 00:00:23,500', '校正后可撤销，也可直接导出 SRT', '',
     ].join('\n'), 'demo.srt');
   });
 

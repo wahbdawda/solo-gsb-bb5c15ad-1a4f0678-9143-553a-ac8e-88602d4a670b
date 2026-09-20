@@ -394,3 +394,58 @@ td.delta-zero { color: #6b7086; }
 }
 
 tbody tr.frame-affected { background: rgba(63, 185, 80, 0.08); }
+
+/* ---------- 读速校正 ---------- */
+
+#readspeed-panel {
+  flex: none;
+  max-height: 42%;
+  padding: 8px 16px;
+  background: #1a1c26;
+  border-bottom: 1px solid #2c2f3c;
+  overflow: auto;
+}
+
+#readspeed-panel:not([hidden]) { display: flex; flex-direction: column; }
+
+#readspeed-cps { width: 64px; }
+
+#readspeed-info {
+  margin-top: 6px;
+  font-size: 12px;
+  color: #8fd18f;
+}
+
+#readspeed-info.warn { color: #f0b35e; }
+
+#readspeed-conflicts {
+  margin: 4px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+#readspeed-conflicts li {
+  color: #f0b35e;
+  font-size: 12px;
+  cursor: pointer;
+  padding: 2px 0;
+}
+
+#readspeed-conflicts li:hover { text-decoration: underline; }
+
+#readspeed-preview {
+  margin-top: 8px;
+  overflow: auto;
+  border: 1px solid #2c2f3c;
+  border-radius: 6px;
+}
+
+#readspeed-preview table { font-size: 12px; }
+#readspeed-preview th, #readspeed-preview td { padding: 4px 8px; }
+
+.block.readspeed-affected {
+  border-color: #3fb950;
+  box-shadow: 0 0 0 1px #3fb950;
+}
+
+tbody tr.readspeed-affected { background: rgba(63, 185, 80, 0.08); }
